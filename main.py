@@ -19,6 +19,7 @@ def main():
         'data/output',
         'data/raw',
         'data/raw/by_position',
+        'data/raw/stats'
     ]
     
     valid_positions = [

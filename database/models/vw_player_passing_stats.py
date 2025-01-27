@@ -7,41 +7,38 @@ from typing import List
 Base = declarative_base()
 metadata = MetaData()
 
-class VwPlayers(Base):
-    __table__ = Table(
-        'vw_players',
+class VwPlayerPassingStats(Base):
+    __table__ = Table (
+        'vw_player_passing_stats',
         metadata,
+        Column('espn_player_id', String),
         Column('master_player_id', String, primary_key=True),
-        Column('player_source_id', String),
-        Column('ap_team_id', Integer),
-        Column('team_name', String),
-        Column('team_image_url', String),
-        Column('name', String),
+        Column('season', String, primary_key=True),
+        Column('player_name', String),
         Column('position', String),
-        Column('class', String),
-        Column('height_inches', Integer),
-        Column('weight_lbs', Integer),
-        Column('birthplace', String),
-        Column('profile_img_url', String),
-        Column('inferred_season', String),
-        Column('created_at', DateTime),
-        Column('updated_at', DateTime),
-        Column('school_type', String),
-        Column('source', String),
-        Column('valuation', String),
-        Column('valuation_number', Float),
-        Column('nil_rating', Float),
-        Column('instagram_url', String),
-        Column('instagram_followers', Integer),
-        Column('x_url', String),
-        Column('x_followers', Integer),
-        Column('tiktok_url', String),
-        Column('tiktok_followers', Integer),
-        schema='views'  # Specify the schema
+        Column('completions', String),
+        Column('attempts', String),
+        Column('passing_yards', String),
+        Column('passing_tds', String),
+        Column('interceptions', String),
+        Column('qb_rating', String),
+        Column('completion_percentage', String),
+        Column('yards_per_attempt', String),
+        Column('ensemble_predicted_passing_yards', String),
+        Column('gradient_boosting_predicted_passing_yards', String),
+        Column('lasso_predicted_passing_yards', String),
+        Column('linear_regression_predicted_passing_yards', String),
+        Column('neural_network_predicted_passing_yards', String),
+        Column('random_forest_predicted_passing_yards', String),
+        Column('ridge_predicted_passing_yards', String),
+        Column('previous_season_passing_yards', String),
+        Column('yards_vs_prediction', String),
+        Column('prediction_accuracy_percentage', String),
+        schema='views'
     )
     
     def __repr__(self):
-        return f"<VwPlayers(master_player_id={self.master_player_id}, name={self.name})>"
+        return f"<VwPlayersPassingStats(master_player_id={self.master_player_id}, name={self.name})>"
     
     @classmethod
     def to_dataframe(cls, db_session, limit: int = 1000) -> pd.DataFrame:
@@ -102,40 +99,16 @@ class VwPlayers(Base):
                 
         return df
     
-    # Example usage with your existing database connection:
-    """
-    with get_db() as db:
-        players = fetch_players(db)
-        for player in players:
-            print(f"Player: {player.name}, Position: {player.position}")
-    """
-    # fetch all players (with limit)
     @classmethod
-    def fetch_players(cls, db_session, limit: int = 1000):
+    def fetch_player_passing_stats(cls, db_session) -> pd.DataFrame:
         """
-        Fetch players from the view with an optional limit.
+        Fetch passing stats for players
+
+        Args:
+            db_session (_type_): _description_
+        """
         
-        Args:
-            db_session: SQLAlchemy session
-            limit: Maximum number of records to return
-            
-        Returns:
-            List of VwPlayers objects
-        """
-        return db_session.query(cls).limit(limit).all()
-
-    @classmethod
-    def fetch_all_college_players(cls, db_session) -> pd.DataFrame:
-        """
-        Fetch all players where source = 'espn' as a DataFrame.
-
-        Args:
-            db_session: SQLAlchemy session
-            
-        Returns:
-            pandas DataFrame containing college player data
-        """
-        query = db_session.query(cls).filter(cls.source == 'espn')
+        query = db_session.query(cls)
         df = pd.read_sql(query.statement, db_session.bind)
         
         # Convert timestamp columns to datetime
@@ -145,5 +118,3 @@ class VwPlayers(Base):
                 df[col] = pd.to_datetime(df[col])
                 
         return df
-        
-        
