@@ -1,4 +1,6 @@
+from pipelines.data_engineering import DataEngineeringPipeline
 from pipelines.data_fetching import DataFetchingPipeline
+from pipelines.machine_learning_pipeline import MachineLearningPipeline
 from util.logging.logger import setup_logging
 import os
 
@@ -19,7 +21,8 @@ def main():
         'data/output',
         'data/raw',
         'data/raw/by_position',
-        'data/raw/stats'
+        'data/raw/stats',
+        'data/engineered'
     ]
     
     valid_positions = [
@@ -48,7 +51,21 @@ def main():
     
     data_fetching_pipeline = DataFetchingPipeline(logger, valid_positions, mode)
     
-    data_fetching_pipeline.run()
+    # data_fetching_pipeline.run()
+    
+    print("\n")
+    
+    data_engineering_pipeline = DataEngineeringPipeline(logger=logger, mode=mode)
+    
+    # data_engineering_pipeline.run()
+    
+    # exit()
+    
+    print("\n")
+    
+    machine_learning_pipeline = MachineLearningPipeline(logger=logger, mode=mode)
+    
+    machine_learning_pipeline.run()
             
     
     
