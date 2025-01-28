@@ -11,7 +11,6 @@ class VwPlayerRushingStats(Base):
     __table__ = Table (
         'vw_player_rushing_stats',
         metadata,
-        Column('espn_player_id', String),
         Column('master_player_id', String, primary_key=True),
         Column('season', String, primary_key=True),
         Column('player_name', String),

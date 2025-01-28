@@ -5,395 +5,420 @@ import glob
 import re
 from logging import Logger
 import pickle
-
-
 from sklearn.metrics import r2_score
-
-from database.db_manager import get_db
-from database.models.vw_player_passing_stats import VwPlayerPassingStats
-from database.models.vw_player_receiving_stats import VwPlayerReceivingStats
-from database.models.vw_player_rushing_stats import VwPlayerRushingStats
-from database.models.vw_players import VwPlayers
+import torch
 import pandas as pd
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, confusion_matrix, mean_absolute_error, mean_squared_error, roc_curve, auc
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 import matplotlib.pyplot as plt
-import seaborn as sns
-import os
 import numpy as np
-
+from pipelines.helpers.model_results_saver import ModelResultsSaver
+from pipelines.machine_learning_models.linear_regression import LinearRegressionTrainer
+from pipelines.machine_learning_models.light_gbm import LightGBMTrainer
+from pipelines.machine_learning_models.neural_network import NeuralNetworkTrainer
+from pipelines.machine_learning_models.random_forest import RandomForestTrainer
+from pipelines.helpers.model_visualizer import ModelVisualizer
 
 class MachineLearningPipeline:
-    def __init__(self, logger: Logger, mode: int, engineered_data_path: str = "data/engineered", machine_learning_path: str = "data/ml_ready"):
+    def __init__(self, logger: Logger, mode: int, upcoming_season: int, test_season: int,
+                 engineered_data_path: str = "data/engineered", 
+                 machine_learning_path: str = "data/ml_ready"):
         self.logger = logger
         self.mode = mode
+        self.upcoming_season = upcoming_season
+        self.test_season = test_season
         self.engineered_data_path = engineered_data_path
-        self.machine_learning_base_path = machine_learning_path  # Renamed to indicate this is the base path
-        self.machine_learning_path = None  # Will be set when get_new_run_path is called
-        self.players = None
-        self.test_season = 2024
-        
+        self.machine_learning_base_path = machine_learning_path
+        self.run_path = None  # Will store the newly created run folder
+        self.models = [
+            "random_forest", 
+            "lightgbm", 
+            "neural_network", 
+            "linear"
+        ]
+        self.positions = {}
+        self.target_features = {
+            'QB': {
+                'passing': 'passing_yards',
+                'rushing': 'rush_yards'
+            },
+            'RB': {
+                'rushing': 'rush_yards',
+                'receiving': 'receiving_yards'
+            },
+            'WR': {
+                'receiving': 'receiving_yards'
+            }
+        }
+
     def get_new_run_path(self):
-        """
-        Creates a new versioned run directory and returns its path.
-        Format: model_run_XXX where XXX is an incrementing number
-        """
-        # Get all existing run directories
+        """Create a new top-level run directory once per script execution."""
         run_pattern = os.path.join(self.machine_learning_base_path, "model_run_*")
         existing_runs = glob.glob(run_pattern)
-        
-        # Find the highest run number
+
         max_run_num = 0
         for run in existing_runs:
             match = re.search(r'model_run_(\d{3})', run)
             if match:
                 run_num = int(match.group(1))
                 max_run_num = max(max_run_num, run_num)
-        
-        # Create new run number and directory
+
         new_run_num = max_run_num + 1
-        new_run_dir = os.path.join(self.machine_learning_base_path, f"model_run_{new_run_num:03d}")
-        
-        # Create the directory and necessary subdirectories
-        os.makedirs(new_run_dir, exist_ok=True)
-        
-        # Log the creation of new run directory
-        self.logger.info(f"Created new model run directory: {new_run_dir}")
-        
-        return new_run_dir
-    
-    def compare_runs(self, run_numbers=None):
-        """
-        Compare metrics across different runs.
-        If run_numbers is None, compares all runs.
-        """
-        run_pattern = os.path.join(self.machine_learning_base_path, "model_run_*")
-        available_runs = glob.glob(run_pattern)
-        
-        if run_numbers:
-            runs_to_compare = [os.path.join(self.machine_learning_base_path, f"model_run_{num:03d}") 
-                             for num in run_numbers]
+        base_run_dir = os.path.join(self.machine_learning_base_path, f"model_run_{new_run_num:03d}")
+        os.makedirs(base_run_dir, exist_ok=True)
+
+        self.logger.info(f"Created new run directory: {base_run_dir}")
+        return base_run_dir
+
+    def train_model(self, model_type: str, x_train, y_train, position, stat_type):
+        """Train model based on selected model type."""
+        if model_type == "random_forest":
+            trainer = RandomForestTrainer(self.logger, self.run_path)
+            return trainer.train(x_train, y_train)
+        elif model_type == "lightgbm":
+            trainer = LightGBMTrainer(self.logger, self.run_path)
+            return trainer.train(x_train, y_train)
+        elif model_type == "linear":
+            trainer = LinearRegressionTrainer(self.logger, self.run_path)
+            return trainer.train(x_train, y_train)
+        elif model_type == "neural_network":
+            trainer = NeuralNetworkTrainer(self.logger, self.run_path)
+            return trainer.train(x_train, y_train, position=position, stat_type=stat_type)
         else:
-            runs_to_compare = available_runs
-        
-        comparison_results = {}
-        
-        for run_path in runs_to_compare:
-            run_name = os.path.basename(run_path)
-            comparison_results[run_name] = {}
-            
-            # Get all position directories in the run
-            position_dirs = glob.glob(os.path.join(run_path, "*"))
-            for position_dir in position_dirs:
-                if not os.path.isdir(position_dir):
-                    continue
-                    
-                position = os.path.basename(position_dir)
-                metadata_path = os.path.join(position_dir, 'run_metadata.json')
-                
-                if os.path.exists(metadata_path):
-                    with open(metadata_path, 'r') as f:
-                        metadata = json.load(f)
-                        comparison_results[run_name][position] = metadata
-        
-        return comparison_results
-        
-    def train_random_forest(self, x_train, y_train):
-        """
-        Train Random Forest model with extensive hyperparameter tuning
-        """
-        self.logger.info("Training Random Forest Model with GridSearchCV")
-        
-        from sklearn.ensemble import RandomForestRegressor
-        from sklearn.model_selection import GridSearchCV
-        
-        # Define an extensive parameter grid
-        param_grid = {
-            'n_estimators': [100, 200, 500, 1000],
-            'max_depth': [10, 20, 30, 40, 50, None],
-            'min_samples_split': [2, 5, 10],
-            'min_samples_leaf': [1, 2, 4],
-            'max_features': ['sqrt', 'log2', None],
-            'bootstrap': [True, False],
-            'max_samples': [0.7, 0.8, 0.9, None],
-            'min_impurity_decrease': [0.0, 0.01, 0.1]
-        }
-        
-        # Initialize base model
-        base_model = RandomForestRegressor(random_state=42, n_jobs=-1)
-        
-        # Initialize GridSearchCV
-        grid_search = GridSearchCV(
-            estimator=base_model,
-            param_grid=param_grid,
-            cv=5,  # 5-fold cross-validation
-            scoring='neg_mean_squared_error',  # Using MSE as our metric
-            verbose=2,  # Detailed output
-            n_jobs=-1  # Use all available cores
-        )
-        
-        # Fit GridSearchCV
-        self.logger.info("Starting GridSearchCV fit - this may take a while...")
-        grid_search.fit(x_train, y_train)
-        
-        # Log best parameters and score
-        self.logger.info(f"Best parameters found: {grid_search.best_params_}")
-        self.logger.info(f"Best cross-validation score: {-grid_search.best_score_}")  # Negative because of scoring metric
-        
-        # Save grid search results
-        results_dir = os.path.join(self.machine_learning_path, 'grid_search_results')
-        os.makedirs(results_dir, exist_ok=True)
-        
-        # Save detailed CV results
-        cv_results = pd.DataFrame(grid_search.cv_results_)
-        cv_results.to_csv(os.path.join(results_dir, 'grid_search_results.csv'), index=False)
-        
-        # Save best parameters
-        with open(os.path.join(results_dir, 'best_parameters.json'), 'w') as f:
-            json.dump(grid_search.best_params_, f, indent=4)
-        
-        return grid_search.best_estimator_
-    
-    def prepare_data(self, data, position):
-        """
-        Prepare data for machine learning by splitting features and target, excluding first-year players
-        """
-        self.logger.info(f"Preparing {position} data for machine learning")
-        
-        print("Original data shape:", data.shape)
-        
-        # Identify first-year players (all previous stats are 0)
-        # previous_stat_columns = [col for col in data.columns if 'previous_' in col or 'ewma' in col]
-        # new_player_mask = (data[previous_stat_columns] == 0).all(axis=1)
-        
-        # # Remove first-year players
-        # data = data[~new_player_mask]
-        # print("Data shape after removing first-year players:", data.shape)
-        # print("Unique seasons in data:", sorted(data['season'].unique()))
-        
-        # Store player IDs before dropping
+            raise ValueError(f"Invalid model type: {model_type}")
+
+    def prepare_data(self, data, position, stat_type, is_upcoming=False):
+        """Prepare data for either test season validation or upcoming season predictions."""
+        self.logger.info(f"Preparing {position} {stat_type} data for {'upcoming season' if is_upcoming else 'test season'}")
+
         player_ids = data['master_player_id']
-        
-        # Drop player ID and season columns
         features_data = data.drop(['master_player_id'], axis=1)
-        
-        target_map = {
-            'QB': 'passing_yards',
-            'RB': 'rushing_yards',
-            'WR': 'receiving_yards'
-        }
-        target_col = target_map[position]
+        target_col = self.target_features[position][stat_type]
         
         y = features_data[target_col]
         X = features_data.drop([target_col, 'season'], axis=1)
-        
-        train_mask = features_data['season'] < self.test_season
-        test_mask = features_data['season'] == self.test_season
-        
-        print("Number of training samples:", train_mask.sum())
-        print("Number of test samples:", test_mask.sum())
-        print("Training seasons:", sorted(features_data[train_mask]['season'].unique()))
-        print("Test seasons:", sorted(features_data[test_mask]['season'].unique()))
-        
-        X_train = X[train_mask]
-        X_test = X[test_mask]
-        y_train = y[train_mask]
-        y_test = y[test_mask]
-        player_ids_test = player_ids[test_mask]
-        
-        print("X_train shape:", X_train.shape)
-        print("X_test shape:", X_test.shape)
-        
-        # Save to csv
-        X_train.to_csv(os.path.join(self.machine_learning_path, 'X_train.csv'), index=False)
-        X_test.to_csv(os.path.join(self.machine_learning_path, 'X_test.csv'), index=False)
-        y_train.to_csv(os.path.join(self.machine_learning_path, 'y_train.csv'), index=False)
-        y_test.to_csv(os.path.join(self.machine_learning_path, 'y_test.csv'), index=False)
-        
-        print(f"Training set size: {len(X_train)}")
-        print(f"Test set size: {len(X_test)}")
-        
-        return X_train, X_test, y_train, y_test, player_ids_test
 
+        if is_upcoming:
+            # For upcoming season, use all historical data for training
+            X_train = X[features_data['season'] <= self.test_season]
+            y_train = y[features_data['season'] <= self.test_season]
+            X_test = X[features_data['season'] == self.upcoming_season]
+            y_test = y[features_data['season'] == self.upcoming_season]
+            player_ids_test = player_ids[features_data['season'] == self.upcoming_season]
+        else:
+            # For test season validation
+            train_mask = features_data['season'] < self.test_season
+            test_mask = features_data['season'] == self.test_season
+            X_train = X[train_mask]
+            X_test = X[test_mask]
+            y_train = y[train_mask]
+            y_test = y[test_mask]
+            player_ids_test = player_ids[test_mask]
 
-    def evaluate_model(self, model, X_test, y_test, position, player_ids):
-        """
-        Comprehensive evaluation function with multiple metrics and diagnostic plots
-        """
-        self.logger.info(f"Evaluating {position} model")
-        results_dir = os.path.join(self.machine_learning_path, position)
+        return X_train, X_test, y_train, y_test, player_ids_test, target_col
+
+    def evaluate_and_save(self, model, model_type, X_test, y_test, position, stat_type, player_ids, target_col, is_upcoming=False):
+        """Evaluate model and save results to appropriate directory."""
+        self.logger.info(f"Evaluating {position} {stat_type} model for {'upcoming season' if is_upcoming else 'test season'}")
+        
+        base_path = "data/output" if is_upcoming else self.run_path
+        results_dir = os.path.join(base_path, model_type, position, stat_type)
         os.makedirs(results_dir, exist_ok=True)
-        
-        # Get predictions for both training and test sets
-        y_pred = model.predict(X_test)
-        
-        # Calculate various metrics
-        r2_test = r2_score(y_test, y_pred)
-        mse = mean_squared_error(y_test, y_pred)
-        mae = mean_absolute_error(y_test, y_pred)
-        rmse = np.sqrt(mse)
-        
-        # Print comprehensive metrics
-        print(f"\nModel Performance Metrics for {position}:")
-        print(f"R² Score (Test): {r2_test:.4f}")
-        print(f"Mean Squared Error: {mse:.4f}")
-        print(f"Root Mean Squared Error: {rmse:.4f}")
-        print(f"Mean Absolute Error: {mae:.4f}")
-        
-        # Save metrics to file
+
+        # Get predictions
+        if model_type == "neural_network":
+            trainer = NeuralNetworkTrainer(self.logger, self.run_path)
+            y_pred = trainer.predict(model, X_test, position=position, stat_type=stat_type)
+        else:
+            y_pred = model.predict(X_test)
+
+        # Calculate metrics
         metrics_dict = {
-            'r2_test': r2_test,
-            'mse': mse,
-            'rmse': rmse,
-            'mae': mae
+            'r2_test': r2_score(y_test, y_pred),
+            'mse': mean_squared_error(y_test, y_pred),
+            'rmse': np.sqrt(mean_squared_error(y_test, y_pred)),
+            'mae': mean_absolute_error(y_test, y_pred),
+            'target_feature': target_col
         }
-        
-        with open(os.path.join(results_dir, 'metrics.txt'), 'w') as f:
-            for metric, value in metrics_dict.items():
-                f.write(f"{metric}: {value}\n")
-        
-        # 1. Scatter plot with perfect prediction line
-        plt.figure(figsize=(10, 10))
-        plt.scatter(y_test, y_pred, alpha=0.5)
-        min_val = min(min(y_test), min(y_pred))
-        max_val = max(max(y_test), max(y_pred))
-        line = np.linspace(min_val, max_val, 100)
-        plt.plot(line, line, 'r--', label='Perfect Prediction')
-        plt.xlabel('Actual Values')
-        plt.ylabel('Predicted Values')
-        plt.title(f'{position} Model: Predicted vs Actual Values\nR² = {r2_test:.4f}')
-        plt.legend()
-        plt.grid(True, linestyle='--', alpha=0.7)
-        plt.axis('equal')
-        plt.savefig(os.path.join(results_dir, 'prediction_scatter.png'))
-        plt.close()
-        
-        # 2. Feature Importance Plot
-        feature_importance = pd.DataFrame({
-            'feature': X_test.columns,
-            'importance': model.feature_importances_
-        }).sort_values('importance', ascending=False)
-        
-        plt.figure(figsize=(12, 6))
-        plt.bar(range(len(feature_importance)), feature_importance['importance'])
-        plt.xticks(range(len(feature_importance)), feature_importance['feature'], rotation=45, ha='right')
-        plt.title(f'{position} Model: Feature Importance')
-        plt.tight_layout()
-        plt.savefig(os.path.join(results_dir, 'feature_importance.png'))
-        plt.close()
-        
-        # Save feature importance to a text file
-        with open(os.path.join(results_dir, 'feature_importance.txt'), 'w') as f:
-            for index, row in feature_importance.iterrows():
-                f.write(f"{row['feature']}: {row['importance']}\n")
-        
-        # 3. Residual Plot
-        residuals = y_test - y_pred
-        plt.figure(figsize=(10, 6))
-        plt.scatter(y_pred, residuals, alpha=0.5)
-        plt.axhline(y=0, color='r', linestyle='--')
-        plt.xlabel('Predicted Values')
-        plt.ylabel('Residuals')
-        plt.title(f'{position} Model: Residual Plot')
-        plt.grid(True, linestyle='--', alpha=0.7)
-        plt.savefig(os.path.join(results_dir, 'residuals.png'))
-        plt.close()
-        
-        # Save predictions vs actual with residuals for analysis
-        results_df = pd.DataFrame({
-            'master_player_id': player_ids,
-            'actual': y_test,
-            'predicted': y_pred,
-            'residual': residuals,
-            'abs_residual': np.abs(residuals)
-        })
-        
-        # Add top 10 largest residuals analysis
-        top_residuals = results_df.nlargest(10, 'abs_residual')
-        print("\nTop 10 Largest Prediction Errors:")
-        print(top_residuals[['master_player_id', 'actual', 'predicted', 'residual']])
-        
-        results_df.to_csv(os.path.join(results_dir, 'predictions_detailed.csv'), index=False)
-        
-        # Save model parameters
-        with open(os.path.join(results_dir, 'model_params.txt'), 'w') as f:
-            f.write("Model Parameters:\n")
-            for param, value in model.get_params().items():
-                f.write(f"{param}: {value}\n")
-        
+
+        # Save results
+        results_saver = ModelResultsSaver(self.logger)
+        results_saver.save_metrics(metrics_dict, results_dir)
+        results_df = results_saver.save_detailed_results(y_test, y_pred, player_ids, f"{position}_{stat_type}", results_dir)
+
+        # Create visualizations only for test season validation
+        if not is_upcoming:
+            visualizer = ModelVisualizer()
+            visualizer.create_scatter_plot(y_test, y_pred, metrics_dict['r2_test'], f"{position}_{stat_type}", results_dir)
+            visualizer.create_residual_plot(y_test, y_pred, f"{position}_{stat_type}", model_type, results_dir)
+            
+            if model_type in ["random_forest", "lightgbm"]:
+                visualizer.create_feature_importance_plot(model, X_test, f"{position}_{stat_type}", model_type, results_dir)
+
         return results_df, metrics_dict
 
+    def organize_and_save_predictions(self, all_results, is_upcoming=False):
+        """
+        Organizes predictions from all models and creates ensemble predictions with confidence intervals.
+        
+        Args:
+            all_results: Dictionary containing results from all models
+            is_upcoming: Boolean indicating if these are predictions for the upcoming season
+        """
+        # Set base path based on whether this is for upcoming season or test season
+        output_base_path = "data/output" if is_upcoming else self.run_path
+        os.makedirs(output_base_path, exist_ok=True)
+        
+        # Process each position and stat type separately
+        for position in self.positions.keys():
+            for stat_type in self.target_features[position].keys():
+                position_predictions = {}
+                player_ids = None
+                target_col = None
+                
+                # Collect predictions from each model
+                for model_type in self.models:
+                    predictions_path = os.path.join(
+                        "data/output" if is_upcoming else self.run_path,
+                        model_type, 
+                        position, 
+                        stat_type, 
+                        'predictions_detailed.csv'
+                    )
+                    if os.path.exists(predictions_path):
+                        pred_df = pd.read_csv(predictions_path)
+                        
+                        if player_ids is None:
+                            player_ids = pred_df['master_player_id']
+                            target_col = self.target_features[position][stat_type]
+                        
+                        position_predictions[f'{model_type}_prediction'] = pred_df['predicted']
+                
+                if position_predictions:
+                    # Create combined DataFrame
+                    combined_df = pd.DataFrame({
+                        'master_player_id': player_ids,
+                        'target_feature': target_col
+                    })
+                    
+                    # Add individual model predictions
+                    for model_name, preds in position_predictions.items():
+                        combined_df[model_name] = preds
+                    
+                    # Calculate ensemble prediction
+                    prediction_columns = [col for col in combined_df.columns if col.endswith('_prediction')]
+                    if prediction_columns:
+                        # Mean prediction
+                        combined_df['ensemble_prediction'] = combined_df[prediction_columns].mean(axis=1)
+                        
+                        # Calculate prediction intervals with scaling based on prediction magnitude
+                        predictions_array = combined_df[prediction_columns].values
+                        
+                        # Scale confidence intervals based on prediction magnitude
+                        prediction_magnitude = combined_df['ensemble_prediction']
+                        magnitude_factor = np.clip(prediction_magnitude / prediction_magnitude.mean(), 0.5, 2.0)
+                        
+                        # Standard deviation across model predictions
+                        prediction_std = np.std(predictions_array, axis=1)
+                        
+                        # Calculate historical error rate based on individual model performance
+                        model_errors = []
+                        for col in prediction_columns:
+                            if 'actual_value' in combined_df.columns:
+                                mae = mean_absolute_error(combined_df['actual_value'], combined_df[col])
+                                model_errors.append(mae)
+                        
+                        # Average historical error
+                        avg_historical_error = np.mean(model_errors) if model_errors else prediction_std.mean()
+                        
+                        # Use the larger of model variance or historical error for confidence bounds
+                        # We use 1.96 for 95% confidence interval
+                        base_interval = np.maximum(prediction_std, avg_historical_error) * 1.96
+                        confidence_interval = base_interval * magnitude_factor
+                        
+                        # Add prediction intervals to DataFrame
+                        combined_df['prediction_lower_bound'] = combined_df['ensemble_prediction'] - confidence_interval
+                        combined_df['prediction_upper_bound'] = combined_df['ensemble_prediction'] + confidence_interval
+                        combined_df['confidence_interval'] = confidence_interval
+                        
+                        # Ensure lower bounds aren't negative for yards
+                        if 'yards' in target_col.lower():
+                            combined_df['prediction_lower_bound'] = combined_df['prediction_lower_bound'].clip(lower=0)
+                        
+                        # Calculate uncertainty percentage
+                        combined_df['uncertainty_percentage'] = (confidence_interval / combined_df['ensemble_prediction'] * 100).round(1)
+                    
+                    # Add actual values if available (only for test season)
+                    if not is_upcoming and 'actual_value' in pred_df.columns:
+                        combined_df['actual_value'] = pred_df['actual_value']
+                    
+                    # Save to appropriate folder
+                    position_path = os.path.join(output_base_path, position, stat_type)
+                    os.makedirs(position_path, exist_ok=True)
+                    output_file = os.path.join(position_path, f'{position}_{stat_type}_predictions.csv')
+                    combined_df.to_csv(output_file, index=False)
+                    
+                    self.logger.info(f"Saved combined predictions for {position} {stat_type} to {output_file}")
+                    
+                    # Create summary statistics only if we have actual values (test season)
+                    if not is_upcoming and 'actual_value' in combined_df.columns:
+                        summary_stats = pd.DataFrame({
+                            'model': prediction_columns + ['ensemble_prediction'],
+                            'target_feature': target_col,
+                            'mae': [mean_absolute_error(combined_df['actual_value'], 
+                                                    combined_df[col]) for col in prediction_columns + ['ensemble_prediction']],
+                            'rmse': [np.sqrt(mean_squared_error(combined_df['actual_value'], 
+                                                            combined_df[col])) for col in prediction_columns + ['ensemble_prediction']],
+                            'r2': [r2_score(combined_df['actual_value'], 
+                                        combined_df[col]) for col in prediction_columns + ['ensemble_prediction']]
+                        })
+                        
+                        # Add average uncertainty metrics to summary
+                        summary_stats.loc[len(summary_stats)] = [
+                            'prediction_intervals',
+                            target_col,
+                            combined_df['confidence_interval'].mean(),
+                            combined_df['confidence_interval'].std(),
+                            combined_df['uncertainty_percentage'].mean()
+                        ]
+                        
+                        # Save summary statistics
+                        stats_file = os.path.join(position_path, f'{position}_{stat_type}_model_performance_summary.csv')
+                        summary_stats.to_csv(stats_file, index=False)
+                        self.logger.info(f"Saved performance summary for {position} {stat_type} to {stats_file}")
+
     def run(self):
+        """Run the pipeline for both test season validation and upcoming season predictions."""
         self.logger.info("Running Machine Learning Pipeline")
-        
-        # Set up the versioned run directory
-        self.machine_learning_path = self.get_new_run_path()
-        
-        # Load data
-        qb_passing = pd.read_csv(os.path.join(self.engineered_data_path, "qb_passing_stats.csv"))
-        rb_rushing = pd.read_csv(os.path.join(self.engineered_data_path, "rb_rushing_stats.csv"))
-        wr_receiving = pd.read_csv(os.path.join(self.engineered_data_path, "wr_receiving_stats.csv"))
-        
-        # Process each position
-        positions = {
-            'QB': qb_passing,
-            # 'RB': rb_rushing,
-            # 'WR': wr_receiving
+        self.run_path = self.get_new_run_path()
+
+        # Load all data files
+        data_files = {
+            'QB': {
+                'passing': pd.read_csv(os.path.join(self.engineered_data_path, "qb_passing_stats.csv")),
+                'rushing': pd.read_csv(os.path.join(self.engineered_data_path, "qb_rushing_stats.csv"))
+            },
+            'RB': {
+                'rushing': pd.read_csv(os.path.join(self.engineered_data_path, "rb_rushing_stats.csv")),
+                'receiving': pd.read_csv(os.path.join(self.engineered_data_path, "rb_receiving_stats.csv"))
+            },
+            'WR': {
+                'receiving': pd.read_csv(os.path.join(self.engineered_data_path, "wr_receiving_stats.csv"))
+            }
         }
         
-        results = {}
-        for position, data in positions.items():
-            self.logger.info(f"Processing {position} data")
-            
-            # Create position-specific directory within the run directory
-            position_dir = os.path.join(self.machine_learning_path, position)
-            os.makedirs(position_dir, exist_ok=True)
-            
-            # Prepare data
-            X_train, X_test, y_train, y_test, player_ids_test = self.prepare_data(data, position)
-            
-            # Train model
-            model = self.train_random_forest(X_train, y_train)
-            
-            # Evaluate model
-            report, metrics = self.evaluate_model(model, X_test, y_test, position, player_ids_test)
-            
-            # Store results
-            results[position] = {
-                'model': model,
-                'report': report,
-                'metrics': metrics
-            }
-            
-            # Save model
-            model_path = os.path.join(position_dir, 'model.pkl')
-            with open(model_path, 'wb') as f:
-                pickle.dump(model, f)
-            
-            # Save run metadata
-            metadata = {
-                'run_timestamp': datetime.datetime.now().isoformat(),
-                'test_season': self.test_season,
-                'model_parameters': model.get_params(),
-                'metrics': metrics
-            }
-            
-            metadata_path = os.path.join(position_dir, 'run_metadata.json')
-            with open(metadata_path, 'w') as f:
-                json.dump(metadata, f, indent=4)
+        self.positions = data_files
+        all_results = {'test_season': {}, 'upcoming_season': {}}
+
+        # Process each model type
+        for model_type in self.models:
+            self.logger.info(f"\nProcessing {model_type.upper()} model")
+            model_dir = os.path.join(self.run_path, model_type)
+            os.makedirs(model_dir, exist_ok=True)
+
+            results_saver = ModelResultsSaver(self.logger)
+            test_results = {}
+            upcoming_results = {}
+
+            # Process each position and stat type
+            for position, stat_types in data_files.items():
+                test_results[position] = {}
+                upcoming_results[position] = {}
+                
+                for stat_type, data in stat_types.items():
+                    # First, train and evaluate on test season
+                    X_train, X_test, y_train, y_test, player_ids_test, target_col = self.prepare_data(
+                        data, position, stat_type, is_upcoming=False
+                    )
+                    model = self.train_model(model_type, X_train, y_train, position, stat_type)
+                    report, metrics = self.evaluate_and_save(
+                        model, model_type, X_test, y_test, position, stat_type, 
+                        player_ids_test, target_col, is_upcoming=False
+                    )
+                    test_results[position][stat_type] = {
+                        'model': model,
+                        'report': report,
+                        'metrics': metrics
+                    }
+
+                    # Then, retrain on all data and predict upcoming season
+                    X_train, X_test, y_train, y_test, player_ids_test, target_col = self.prepare_data(
+                        data, position, stat_type, is_upcoming=True
+                    )
+                    model = self.train_model(model_type, X_train, y_train, position, stat_type)
+                    report, metrics = self.evaluate_and_save(
+                        model, model_type, X_test, y_test, position, stat_type, 
+                        player_ids_test, target_col, is_upcoming=True
+                    )
+                    upcoming_results[position][stat_type] = {
+                        'model': model,
+                        'report': report,
+                        'metrics': metrics
+                    }
+
+                    # Save model artifacts in test season directory
+                    results_saver.save_model(model, model_type, model_dir)
+                    results_saver.save_run_metadata(model, model_type, self.test_season, metrics, model_dir)
+
+            all_results['test_season'][model_type] = test_results
+            all_results['upcoming_season'][model_type] = upcoming_results
+
+        # Organize predictions for both test and upcoming seasons
+        self.organize_and_save_predictions(all_results['test_season'], is_upcoming=False)
+        self.organize_and_save_predictions(all_results['upcoming_season'], is_upcoming=True)
         
-        # Handle QB predictions
-        players_to_analyze = [
-            'f589f248-558c-48b2-8825-e396b6a19fa3',  # Carson Beck
-            '160d493c-12d7-4e86-a685-eb83bed4f3bd',  # Davis Bryson
-            '514fe10d-d116-42e4-878e-281adaf702e3'   # Jalen Milroe
-        ]
+        #DEBUG get targetted people
+        qb_info = {
+            '160d493c-12d7-4e86-a685-eb83bed4f3bd': ('Bryson Davis', 'Kennesaw State'),
+            '514fe10d-d116-42e4-878e-281adaf702e3': ('Jalen Milroe', 'Alabama'),
+            'f208bc81-d708-48b2-8325-cd8071b3c32d': ('Thomas Castellanos', 'Boston College'),
+            'f589f248-558c-48b2-8825-e396b6a19fa3': ('Carson Beck', 'Georgia'),
+            'f58f8dbe-91e9-42c4-a13f-108aae1fda13': ('Jaxson Dart', 'Ole Miss'),
+        }
+
+        # Create a list to store all predictions
+        qb_predictions = []
+
+        # Get predictions for each quarterback
+        for player_id, (name, school) in qb_info.items():
+            for position, stat_types in data_files.items():
+                for stat_type, data in stat_types.items():
+                    X_train, X_test, y_train, y_test, player_ids_test, target_col = self.prepare_data(
+                        data, position, stat_type, is_upcoming=True
+                    )
+                    
+                    # Get predictions from all models
+                    predictions = {}
+                    for model_type in self.models:
+                        model = all_results['upcoming_season'][model_type][position][stat_type]['model']
+                        if model_type == 'neural_network':
+                            trainer = NeuralNetworkTrainer(self.logger, self.run_path)
+                            pred = trainer.predict(model, X_test, position=position, stat_type=stat_type)
+                        else:
+                            pred = model.predict(X_test)
+                        
+                        player_ids = player_ids_test.to_list()
+                        if player_id in player_ids:
+                            player_index = player_ids.index(player_id)
+                            predictions[f'{model_type}_prediction'] = pred[player_index]
+                    
+                    if predictions:
+                        # Calculate ensemble prediction
+                        ensemble_pred = sum(predictions.values()) / len(predictions)
+                        
+                        qb_predictions.append({
+                            'player_id': player_id,
+                            'name': name,
+                            'school': school,
+                            'stat_type': stat_type,
+                            'ensemble_prediction': round(ensemble_pred, 1),
+                            **{k: round(v, 1) for k, v in predictions.items()}
+                        })
+
+        # Convert to DataFrame and save
+        predictions_df = pd.DataFrame(qb_predictions)
+        #ordery by stat type
+        predictions_df = predictions_df.sort_values(by=['stat_type'])
         
-        qb_predictions = pd.read_csv(os.path.join(self.machine_learning_path, 'QB', 'predictions_detailed.csv'))
-        qb_predictions = qb_predictions[qb_predictions['master_player_id'].isin(players_to_analyze)]
-        
-        # Save predictions in the versioned run directory
-        predictions_path = os.path.join(self.machine_learning_path, 'player_predictions.csv')
-        qb_predictions.to_csv(predictions_path, index=False)
-        
-        return results
+        output_file = os.path.join('data/output', 'targeted_qb_predictions.csv')
+        predictions_df.to_csv(output_file, index=False)
+        self.logger.info(f"Saved targeted QB predictions to {output_file}")

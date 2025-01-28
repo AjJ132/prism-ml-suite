@@ -1,6 +1,7 @@
 from pipelines.data_engineering import DataEngineeringPipeline
 from pipelines.data_fetching import DataFetchingPipeline
 from pipelines.machine_learning_pipeline import MachineLearningPipeline
+from pipelines.save_results import SaveResultsPipeline
 from util.logging.logger import setup_logging
 import os
 
@@ -31,6 +32,9 @@ def main():
         'WR'
     ]
     
+    model_test_season = 2024
+    upcoming_season = 2025
+    
     # ensure directories exist, if mode = destructive, delete all files in all folders
     for folder in folders:
         if mode == 1:
@@ -51,21 +55,25 @@ def main():
     
     data_fetching_pipeline = DataFetchingPipeline(logger, valid_positions, mode)
     
-    # data_fetching_pipeline.run()
+    data_fetching_pipeline.run()
     
     print("\n")
     
-    data_engineering_pipeline = DataEngineeringPipeline(logger=logger, mode=mode)
+    data_engineering_pipeline = DataEngineeringPipeline(logger=logger, mode=mode, upcoming_season=upcoming_season)
     
-    # data_engineering_pipeline.run()
+    data_engineering_pipeline.run()
     
     # exit()
     
     print("\n")
     
-    machine_learning_pipeline = MachineLearningPipeline(logger=logger, mode=mode)
+    machine_learning_pipeline = MachineLearningPipeline(logger=logger, mode=mode, upcoming_season=upcoming_season, test_season=model_test_season)
     
     machine_learning_pipeline.run()
+    
+    save_results_pipeline = SaveResultsPipeline(logger=logger, mode=mode, predictions_season=upcoming_season)
+    
+    save_results_pipeline.run()
             
     
     
